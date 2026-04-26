@@ -47,6 +47,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default="outputs/night2day_dino_probe")
     parser.add_argument("--num-grid", type=int, default=12, help="How many samples to show in pair_grid.png.")
     parser.add_argument("--num-heatmaps", type=int, default=4, help="How many samples to show in relation_heatmaps.png.")
+    parser.add_argument("--num-overlay-samples", type=int, default=2, help="How many pairs to show in patch relation overlay plots.")
+    parser.add_argument(
+        "--overlay-anchors",
+        default="center,upper_left,upper_right,lower_left,lower_right",
+        help="Comma-separated anchor patch names or row:col coordinates for patch_relation_overlays.png.",
+    )
+    parser.add_argument("--overlay-alpha", type=float, default=0.45, help="Heatmap opacity for image overlays.")
     parser.add_argument("--bootstrap-reps", type=int, default=1000)
     return parser.parse_args()
 
@@ -110,6 +117,51 @@ def derangement_indices(n: int, seed: int) -> np.ndarray:
     rng = np.random.default_rng(seed)
     shift = int(rng.integers(1, n))
     return (np.arange(n) + shift) % n
+
+
+def infer_patch_grid(num_tokens: int) -> Tuple[int, int]:
+    side = int(round(float(num_tokens) ** 0.5))
+    if side * side != num_tokens:
+        raise ValueError(f"Expected a square patch-token grid, got {num_tokens} tokens.")
+    return side, side
+
+
+def parse_anchor_spec(spec: str, grid_h: int, grid_w: int) -> List[Tuple[str, int, int]]:
+    named = {
+        "center": (grid_h // 2, grid_w // 2),
+        "upper_left": (grid_h // 4, grid_w // 4),
+        "upper_right": (grid_h // 4, (3 * grid_w) // 4),
+        "lower_left": ((3 * grid_h) // 4, grid_w // 4),
+        "lower_right": ((3 * grid_h) // 4, (3 * grid_w) // 4),
+        "top_left": (0, 0),
+        "top_right": (0, grid_w - 1),
+        "bottom_left": (grid_h - 1, 0),
+        "bottom_right": (grid_h - 1, grid_w - 1),
+    }
+    anchors: List[Tuple[str, int, int]] = []
+    seen = set()
+    for raw in spec.split(","):
+        item = raw.strip()
+        if not item:
+            continue
+        if item in named:
+            row, col = named[item]
+            label = item
+        else:
+            parts = item.split(":")
+            if len(parts) != 2:
+                raise ValueError(f"Unknown anchor '{item}'. Use a name like center or row:col.")
+            row, col = int(parts[0]), int(parts[1])
+            label = f"{row}:{col}"
+        row = max(0, min(grid_h - 1, int(row)))
+        col = max(0, min(grid_w - 1, int(col)))
+        key = (row, col)
+        if key not in seen:
+            anchors.append((label, row, col))
+            seen.add(key)
+    if not anchors:
+        raise ValueError("--overlay-anchors resolved to an empty anchor list.")
+    return anchors
 
 
 def maybe_subsample_tokens(
@@ -374,6 +426,167 @@ def save_relation_heatmaps(
     plt.close(fig)
 
 
+def plot_image_array(image: Image.Image, image_size: int) -> np.ndarray:
+    image = image.convert("RGB").resize((image_size, image_size), Image.Resampling.BICUBIC)
+    return np.asarray(image, dtype=np.float32) / 255.0
+
+
+def add_anchor_box(ax, row: int, col: int, grid_h: int, grid_w: int, image_size: int) -> None:
+    patch_h = float(image_size) / float(grid_h)
+    patch_w = float(image_size) / float(grid_w)
+    rect = plt.Rectangle(
+        (col * patch_w, row * patch_h),
+        patch_w,
+        patch_h,
+        fill=False,
+        edgecolor="cyan",
+        linewidth=1.5,
+    )
+    ax.add_patch(rect)
+
+
+def vector_cosine(a: np.ndarray, b: np.ndarray) -> float:
+    a_flat = a.reshape(-1).astype(np.float64)
+    b_flat = b.reshape(-1).astype(np.float64)
+    denom = np.linalg.norm(a_flat) * np.linalg.norm(b_flat)
+    if denom <= 1e-12:
+        return 0.0
+    return float(np.dot(a_flat, b_flat) / denom)
+
+
+def save_patch_relation_overlays(
+    path: Path,
+    images_a: Sequence[Image.Image],
+    images_b: Sequence[Image.Image],
+    tokens_a: torch.Tensor,
+    tokens_b: torch.Tensor,
+    num_samples: int,
+    anchor_spec: str,
+    image_size: int,
+    alpha: float,
+    remove_diag: bool,
+) -> None:
+    n = min(max(0, num_samples), len(images_a))
+    if n == 0:
+        return
+
+    grid_h, grid_w = infer_patch_grid(tokens_a.shape[1])
+    anchors = parse_anchor_spec(anchor_spec, grid_h, grid_w)
+    rows = n * len(anchors)
+    fig, axes = plt.subplots(rows, 5, figsize=(17, max(3.0, 2.7 * rows)), squeeze=False)
+
+    for sample_idx in range(n):
+        img_a = plot_image_array(images_a[sample_idx], image_size)
+        img_b = plot_image_array(images_b[sample_idx], image_size)
+        gram_a = self_similarity(tokens_a[sample_idx : sample_idx + 1], remove_diag=remove_diag)[0].numpy()
+        gram_b = self_similarity(tokens_b[sample_idx : sample_idx + 1], remove_diag=remove_diag)[0].numpy()
+
+        for anchor_offset, (anchor_label, patch_row, patch_col) in enumerate(anchors):
+            row_idx = sample_idx * len(anchors) + anchor_offset
+            token_idx = patch_row * grid_w + patch_col
+            rel_a = gram_a[token_idx].reshape(grid_h, grid_w)
+            rel_b = gram_b[token_idx].reshape(grid_h, grid_w)
+            rel_diff = np.abs(rel_a - rel_b)
+            row_cos = vector_cosine(rel_a, rel_b)
+            row_mse = float(np.mean((rel_a - rel_b) ** 2))
+
+            panels = [
+                ("A image", img_a, None, None, None),
+                ("B image", img_b, None, None, None),
+                ("A anchor relation", img_a, rel_a, "magma", (-1.0, 1.0)),
+                ("B anchor relation", img_b, rel_b, "magma", (-1.0, 1.0)),
+                ("abs relation diff", img_a, rel_diff, "viridis", (0.0, 1.0)),
+            ]
+            for col_idx, (title, base, heat, cmap, limits) in enumerate(panels):
+                ax = axes[row_idx][col_idx]
+                ax.imshow(base)
+                if heat is not None:
+                    vmin, vmax = limits
+                    ax.imshow(
+                        heat,
+                        cmap=cmap,
+                        alpha=alpha,
+                        interpolation="bilinear",
+                        extent=(0, image_size, image_size, 0),
+                        vmin=vmin,
+                        vmax=vmax,
+                    )
+                add_anchor_box(ax, patch_row, patch_col, grid_h, grid_w, image_size)
+                if row_idx == 0:
+                    ax.set_title(title)
+                ax.set_xticks([])
+                ax.set_yticks([])
+
+            axes[row_idx][0].set_ylabel(
+                f"sample {sample_idx}\n{anchor_label} ({patch_row},{patch_col})",
+                rotation=0,
+                labelpad=48,
+                va="center",
+            )
+            axes[row_idx][4].set_xlabel(f"row cos={row_cos:.3f}, row mse={row_mse:.4f}")
+
+    fig.tight_layout()
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+
+
+def save_patch_relation_similarity_maps(
+    path: Path,
+    images_a: Sequence[Image.Image],
+    images_b: Sequence[Image.Image],
+    tokens_a: torch.Tensor,
+    tokens_b: torch.Tensor,
+    num_samples: int,
+    image_size: int,
+    alpha: float,
+    remove_diag: bool,
+) -> None:
+    n = min(max(0, num_samples), len(images_a))
+    if n == 0:
+        return
+
+    grid_h, grid_w = infer_patch_grid(tokens_a.shape[1])
+    fig, axes = plt.subplots(n, 4, figsize=(14, max(3.0, 3.2 * n)), squeeze=False)
+
+    for sample_idx in range(n):
+        img_a = plot_image_array(images_a[sample_idx], image_size)
+        img_b = plot_image_array(images_b[sample_idx], image_size)
+        gram_a = self_similarity(tokens_a[sample_idx : sample_idx + 1], remove_diag=remove_diag)[0]
+        gram_b = self_similarity(tokens_b[sample_idx : sample_idx + 1], remove_diag=remove_diag)[0]
+        row_cos = F.cosine_similarity(gram_a.float(), gram_b.float(), dim=-1, eps=1e-6).numpy().reshape(grid_h, grid_w)
+        row_mse = ((gram_a - gram_b) ** 2).mean(dim=-1).numpy().reshape(grid_h, grid_w)
+        mse_vmax = max(float(np.percentile(row_mse, 95)), 1e-6)
+
+        panels = [
+            ("A image", img_a, None, None, None),
+            ("B image", img_b, None, None, None),
+            (f"per-anchor row cos mean={row_cos.mean():.3f}", img_a, row_cos, "magma", (0.0, 1.0)),
+            (f"per-anchor row mse mean={row_mse.mean():.4f}", img_a, row_mse, "viridis", (0.0, mse_vmax)),
+        ]
+        for col_idx, (title, base, heat, cmap, limits) in enumerate(panels):
+            ax = axes[sample_idx][col_idx]
+            ax.imshow(base)
+            if heat is not None:
+                vmin, vmax = limits
+                ax.imshow(
+                    heat,
+                    cmap=cmap,
+                    alpha=alpha,
+                    interpolation="bilinear",
+                    extent=(0, image_size, image_size, 0),
+                    vmin=vmin,
+                    vmax=vmax,
+                )
+            ax.set_title(title)
+            ax.set_xticks([])
+            ax.set_yticks([])
+        axes[sample_idx][0].set_ylabel(f"sample {sample_idx}", rotation=0, labelpad=35, va="center")
+
+    fig.tight_layout()
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+
+
 def main() -> None:
     args = parse_args()
     random.seed(args.seed)
@@ -426,8 +639,10 @@ def main() -> None:
         "model_repo": args.model_repo,
         "model_name": args.model_name,
         "image_size": args.image_size,
+        "patch_grid": list(infer_patch_grid(tokens_a.shape[1])),
         "token_subsample": args.token_subsample,
         "remove_diag": args.remove_diag,
+        "overlay_anchors": args.overlay_anchors,
         "shuffled_indices_rule": "cyclic random shift derangement",
         "metrics": {},
     }
@@ -445,7 +660,31 @@ def main() -> None:
     save_scores_csv(output_dir / "scores.csv", paired_scores, shuffled_scores, shuffled_indices)
     save_distribution_plot(output_dir / "score_distributions.png", paired_scores, shuffled_scores)
     save_pair_grid(output_dir / "pair_grid.png", images_a, images_b, shuffled_indices, paired_scores, shuffled_scores, args.num_grid)
-    save_relation_heatmaps(output_dir / "relation_heatmaps.png", tokens_a, tokens_b, shuffled_indices, args.num_heatmaps, args.remove_diag)
+    if args.num_heatmaps > 0:
+        save_relation_heatmaps(output_dir / "relation_heatmaps.png", tokens_a, tokens_b, shuffled_indices, args.num_heatmaps, args.remove_diag)
+    save_patch_relation_overlays(
+        output_dir / "patch_relation_overlays.png",
+        images_a,
+        images_b,
+        tokens_a,
+        tokens_b,
+        args.num_overlay_samples,
+        args.overlay_anchors,
+        args.image_size,
+        args.overlay_alpha,
+        args.remove_diag,
+    )
+    save_patch_relation_similarity_maps(
+        output_dir / "patch_relation_similarity_maps.png",
+        images_a,
+        images_b,
+        tokens_a,
+        tokens_b,
+        args.num_overlay_samples,
+        args.image_size,
+        args.overlay_alpha,
+        args.remove_diag,
+    )
 
     print(json.dumps(summary["metrics"], indent=2))
     print(f"saved outputs to {output_dir.resolve()}")
