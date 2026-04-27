@@ -469,10 +469,6 @@ def kl_rows(ref_logits: torch.Tensor, pred_logits: torch.Tensor, tau: float) -> 
     return (p_ref * (log_ref - log_pred)).sum(dim=-1).mean(dim=-1)
 
 
-def symmetric_kl_rows(a_logits: torch.Tensor, b_logits: torch.Tensor, tau: float) -> torch.Tensor:
-    return 0.5 * (kl_rows(a_logits, b_logits, tau=tau) + kl_rows(b_logits, a_logits, tau=tau))
-
-
 def score_tokens(
     tokens_a: torch.Tensor,
     tokens_b: torch.Tensor,
@@ -494,14 +490,14 @@ def score_tokens(
     rel1_cos = F.cosine_similarity(gram_a.flatten(1), gram_b.flatten(1), dim=-1)
     rel1_l1 = (gram_a - gram_b).abs().flatten(1).mean(dim=-1)
     rel1_l2 = F.mse_loss(gram_a, gram_b, reduction="none").flatten(1).mean(dim=-1)
-    rel1_skl = symmetric_kl_rows(gram_a, gram_b, tau=tau)
+    rel1_kl = kl_rows(gram_a, gram_b, tau=tau)
 
     second_a = second_order_gram(gram_a)
     second_b = second_order_gram(gram_b)
     rel2_cos = F.cosine_similarity(second_a.flatten(1), second_b.flatten(1), dim=-1)
     rel2_l1 = (second_a - second_b).abs().flatten(1).mean(dim=-1)
     rel2_l2 = F.mse_loss(second_a, second_b, reduction="none").flatten(1).mean(dim=-1)
-    rel2_skl = symmetric_kl_rows(second_a, second_b, tau=tau)
+    rel2_kl = kl_rows(second_a, second_b, tau=tau)
     return {
         "token_cos": token_cos.cpu().numpy(),
         "dino_token_l1": token_l1.cpu().numpy(),
@@ -509,11 +505,11 @@ def score_tokens(
         "dino_rel1_cos": rel1_cos.cpu().numpy(),
         "dino_rel1_l1": rel1_l1.cpu().numpy(),
         "dino_rel1_l2": rel1_l2.cpu().numpy(),
-        "dino_rel1_skl": rel1_skl.cpu().numpy(),
+        "dino_rel1_kl": rel1_kl.cpu().numpy(),
         "dino_rel2_cos": rel2_cos.cpu().numpy(),
         "dino_rel2_l1": rel2_l1.cpu().numpy(),
         "dino_rel2_l2": rel2_l2.cpu().numpy(),
-        "dino_rel2_skl": rel2_skl.cpu().numpy(),
+        "dino_rel2_kl": rel2_kl.cpu().numpy(),
     }
 
 
@@ -615,12 +611,17 @@ ALL_RETRIEVAL_METRICS = [
     "dino_rel1_cos",
     "dino_rel1_l1",
     "dino_rel1_l2",
-    "dino_rel1_skl",
+    "dino_rel1_kl",
     "dino_rel2_cos",
     "dino_rel2_l1",
     "dino_rel2_l2",
-    "dino_rel2_skl",
+    "dino_rel2_kl",
 ]
+
+RETRIEVAL_METRIC_ALIASES = {
+    "dino_rel1_skl": "dino_rel1_kl",
+    "dino_rel2_skl": "dino_rel2_kl",
+}
 
 
 @dataclass
@@ -641,7 +642,12 @@ class KlCache:
 def parse_retrieval_metrics(spec: str) -> List[str]:
     if spec.strip().lower() == "all":
         return list(ALL_RETRIEVAL_METRICS)
-    metrics = [item.strip() for item in spec.split(",") if item.strip()]
+    metrics = [
+        RETRIEVAL_METRIC_ALIASES.get(item.strip(), item.strip())
+        for item in spec.split(",")
+        if item.strip()
+    ]
+    metrics = list(dict.fromkeys(metrics))
     unknown = sorted(set(metrics) - set(ALL_RETRIEVAL_METRICS))
     if unknown:
         raise ValueError(f"Unknown retrieval metrics: {unknown}. Valid metrics: {ALL_RETRIEVAL_METRICS}")
@@ -702,6 +708,12 @@ def build_relation_flats(
 
 
 def make_kl_cache(matrix_flat: torch.Tensor, row_count: int, tau: float, dtype: torch.dtype, batch_size: int) -> KlCache:
+    expected_dim = row_count * row_count
+    if matrix_flat.shape[1] != expected_dim:
+        raise ValueError(
+            f"KL cache expected flattened relation dim {expected_dim} "
+            f"({row_count}x{row_count}), got {matrix_flat.shape[1]}."
+        )
     prob_batches = []
     log_prob_batches = []
     const_batches = []
@@ -800,7 +812,7 @@ def rank_vector_metric(
     return RetrievalResult(ranks=better_counts + 1, true_scores=true_scores, higher_is_better=higher_is_better)
 
 
-def aligned_skl_scores(
+def aligned_kl_scores(
     a: KlCache,
     b: KlCache,
     device: torch.device,
@@ -810,32 +822,23 @@ def aligned_skl_scores(
     rows = float(a.row_count)
     for start in range(0, a.probs.shape[0], batch_size):
         p_a = a.probs[start : start + batch_size].to(device=device, dtype=torch.float32)
-        lp_a = a.log_probs[start : start + batch_size].to(device=device, dtype=torch.float32)
         c_a = a.const[start : start + batch_size].to(device=device, dtype=torch.float32)
-        p_b = b.probs[start : start + batch_size].to(device=device, dtype=torch.float32)
         lp_b = b.log_probs[start : start + batch_size].to(device=device, dtype=torch.float32)
-        c_b = b.const[start : start + batch_size].to(device=device, dtype=torch.float32)
         kl_ab = c_a - (p_a * lp_b).sum(dim=-1) / rows
-        kl_ba = c_b - (p_b * lp_a).sum(dim=-1) / rows
-        scores.append((0.5 * (kl_ab + kl_ba)).detach().cpu())
+        scores.append(kl_ab.detach().cpu())
     return torch.cat(scores).numpy()
 
 
-def skl_score_block(a: KlCache, b: KlCache, q_slice: slice, c_slice: slice, device: torch.device) -> torch.Tensor:
+def kl_score_block(a: KlCache, b: KlCache, q_slice: slice, c_slice: slice, device: torch.device) -> torch.Tensor:
     rows = float(a.row_count)
     p_a = a.probs[q_slice].to(device=device, dtype=torch.float32)
-    lp_a = a.log_probs[q_slice].to(device=device, dtype=torch.float32)
     c_a = a.const[q_slice].to(device=device, dtype=torch.float32)
-    p_b = b.probs[c_slice].to(device=device, dtype=torch.float32)
     lp_b = b.log_probs[c_slice].to(device=device, dtype=torch.float32)
-    c_b = b.const[c_slice].to(device=device, dtype=torch.float32)
-    kl_ab = c_a[:, None] - torch.mm(p_a, lp_b.transpose(0, 1)) / rows
-    kl_ba = c_b[None, :] - torch.mm(p_b, lp_a.transpose(0, 1)).transpose(0, 1) / rows
-    return 0.5 * (kl_ab + kl_ba)
+    return c_a[:, None] - torch.mm(p_a, lp_b.transpose(0, 1)) / rows
 
 
 @torch.no_grad()
-def rank_skl_metric(
+def rank_kl_metric(
     name: str,
     a: KlCache,
     b: KlCache,
@@ -846,7 +849,7 @@ def rank_skl_metric(
     if a.probs.shape != b.probs.shape:
         raise ValueError(f"{name}: A/B KL cache shapes differ: {tuple(a.probs.shape)} vs {tuple(b.probs.shape)}")
     n = a.probs.shape[0]
-    true_scores = aligned_skl_scores(a, b, device, max(1, query_batch_size))
+    true_scores = aligned_kl_scores(a, b, device, max(1, query_batch_size))
     better_counts = np.zeros(n, dtype=np.int64)
     for q_start in tqdm(range(0, n, query_batch_size), desc=f"Ranking {name}"):
         q_end = min(q_start + query_batch_size, n)
@@ -855,7 +858,7 @@ def rank_skl_metric(
         q_slice = slice(q_start, q_end)
         for c_start in range(0, n, candidate_batch_size):
             c_end = min(c_start + candidate_batch_size, n)
-            scores = skl_score_block(a, b, q_slice, slice(c_start, c_end), device)
+            scores = kl_score_block(a, b, q_slice, slice(c_start, c_end), device)
             overlap_start = max(q_start, c_start)
             overlap_end = min(q_end, c_end)
             if overlap_start < overlap_end:
@@ -946,11 +949,11 @@ def save_distribution_plot(
         ("dino_rel1_cos", "1st-order relation cosine (higher is better)"),
         ("dino_rel1_l1", "1st-order relation L1 (lower is better)"),
         ("dino_rel1_l2", "1st-order relation L2 (lower is better)"),
-        ("dino_rel1_skl", "1st-order relation symmetric KL (lower is better)"),
+        ("dino_rel1_kl", "1st-order relation KL A->B (lower is better)"),
         ("dino_rel2_cos", "2nd-order relation cosine (higher is better)"),
         ("dino_rel2_l1", "2nd-order relation L1 (lower is better)"),
         ("dino_rel2_l2", "2nd-order relation L2 (lower is better)"),
-        ("dino_rel2_skl", "2nd-order relation symmetric KL (lower is better)"),
+        ("dino_rel2_kl", "2nd-order relation KL A->B (lower is better)"),
     ]
     specs = [(metric, title) for metric, title in specs if metric in paired_scores]
     cols = 3
@@ -1009,9 +1012,9 @@ def save_pair_grid(
             canvas.paste(thumb, (x, y))
             draw_label(draw, (x + 4, y + tile + 4), label)
             if c == 1:
-                draw_label(draw, (x + 4, y + tile + 22), f"2skl={paired_scores['dino_rel2_skl'][r]:.4f}")
+                draw_label(draw, (x + 4, y + tile + 22), f"2kl={paired_scores['dino_rel2_kl'][r]:.4f}")
             if c == 2:
-                draw_label(draw, (x + 4, y + tile + 22), f"2skl={shuffled_scores['dino_rel2_skl'][r]:.4f}")
+                draw_label(draw, (x + 4, y + tile + 22), f"2kl={shuffled_scores['dino_rel2_kl'][r]:.4f}")
 
     canvas.save(path)
 
@@ -1270,7 +1273,7 @@ def run_full_retrieval(
     if rel1_metrics or rel2_metrics:
         rel1_a, rel2_a = build_relation_flats(tokens_a, args.remove_diag, dtype, args.batch_size, bool(rel2_metrics))
         rel1_b, rel2_b = build_relation_flats(tokens_b, args.remove_diag, dtype, args.batch_size, bool(rel2_metrics))
-        row_count = infer_patch_grid(tokens_a.shape[1])[0]
+        row_count = tokens_a.shape[1]
 
         if "dino_rel1_l1" in rel1_metrics:
             results["dino_rel1_l1"] = rank_vector_metric("dino_rel1_l1", rel1_a, rel1_b, "l1", False, ranking_device, qbs, cbs)
@@ -1283,10 +1286,10 @@ def run_full_retrieval(
                 "dino_rel1_cos", rel1_cos_a, rel1_cos_b, "cos", True, ranking_device, qbs, cbs
             )
             del rel1_cos_a, rel1_cos_b
-        if "dino_rel1_skl" in rel1_metrics:
+        if "dino_rel1_kl" in rel1_metrics:
             rel1_kl_a = make_kl_cache(rel1_a, row_count, args.tau, dtype, args.batch_size)
             rel1_kl_b = make_kl_cache(rel1_b, row_count, args.tau, dtype, args.batch_size)
-            results["dino_rel1_skl"] = rank_skl_metric("dino_rel1_skl", rel1_kl_a, rel1_kl_b, ranking_device, qbs, cbs)
+            results["dino_rel1_kl"] = rank_kl_metric("dino_rel1_kl", rel1_kl_a, rel1_kl_b, ranking_device, qbs, cbs)
             del rel1_kl_a, rel1_kl_b
 
         if rel2_metrics:
@@ -1303,10 +1306,10 @@ def run_full_retrieval(
                     "dino_rel2_cos", rel2_cos_a, rel2_cos_b, "cos", True, ranking_device, qbs, cbs
                 )
                 del rel2_cos_a, rel2_cos_b
-            if "dino_rel2_skl" in rel2_metrics:
+            if "dino_rel2_kl" in rel2_metrics:
                 rel2_kl_a = make_kl_cache(rel2_a, row_count, args.tau, dtype, args.batch_size)
                 rel2_kl_b = make_kl_cache(rel2_b, row_count, args.tau, dtype, args.batch_size)
-                results["dino_rel2_skl"] = rank_skl_metric("dino_rel2_skl", rel2_kl_a, rel2_kl_b, ranking_device, qbs, cbs)
+                results["dino_rel2_kl"] = rank_kl_metric("dino_rel2_kl", rel2_kl_a, rel2_kl_b, ranking_device, qbs, cbs)
                 del rel2_kl_a, rel2_kl_b
 
         del rel1_a, rel1_b, rel2_a, rel2_b

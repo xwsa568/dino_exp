@@ -49,9 +49,9 @@ GPU 번호를 직접 고르려면 torch device 문자열을 그대로 넘기면 
 
 - `pixel_l1`, `pixel_l2`: resized RGB pixel vector 차이. 낮을수록 비슷합니다.
 - `dino_token_cos`, `dino_token_l1`, `dino_token_l2`: 같은 spatial DINO patch feature끼리 직접 비교한 metric입니다.
-- `dino_rel1_cos`, `dino_rel1_l1`, `dino_rel1_l2`, `dino_rel1_skl`: DINO patch-token self-similarity matrix, 즉 1차 relation matrix 비교입니다.
-- `dino_rel2_cos`, `dino_rel2_l1`, `dino_rel2_l2`, `dino_rel2_skl`: 1차 relation row들 사이의 relation, 즉 2차 relation matrix 비교입니다.
-- `*_skl`: row-wise softmax 후 symmetric KL을 평균낸 값입니다. 낮을수록 비슷합니다.
+- `dino_rel1_cos`, `dino_rel1_l1`, `dino_rel1_l2`, `dino_rel1_kl`: DINO patch-token self-similarity matrix, 즉 1차 relation matrix 비교입니다.
+- `dino_rel2_cos`, `dino_rel2_l1`, `dino_rel2_l2`, `dino_rel2_kl`: 1차 relation row들 사이의 relation, 즉 2차 relation matrix 비교입니다.
+- `*_kl`: row-wise softmax 후 `KL(A || B)`를 평균낸 값입니다. 낮을수록 비슷합니다.
 
 Paired-vs-shuffled 요약의 `improvement_mean`은 paired가 shuffled보다 좋은 방향을 양수로 정규화한 값입니다. Retrieval 요약에서는 `mean_rank`, `median_rank`, `mrr`, `top1_rate`, `top5_rate`, `top10_rate`, `top1pct_rate`, `mean_pair_percentile`로 어떤 metric이 true pair를 가장 잘 찾는지 비교합니다.
 
