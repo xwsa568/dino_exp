@@ -1,14 +1,14 @@
 # DINO Night2Day Pair Probe
 
-Hugging Face `huggan/night2day`의 `imageA` / `imageB`가 실제 night/day 대응쌍이면, 같은 row의 DINO relation이 row를 섞은 negative pair보다 더 비슷해야 한다는 가정을 테스트하는 작은 standalone 실험입니다.
+Hugging Face `huggan/night2day`의 `imageA` / `imageB`가 실제 night/day 대응쌍이면, 같은 row의 DINO feature/relation이 전체 `imageB` 후보 중에서도 높은 순위로 매칭되어야 한다는 가정을 테스트하는 standalone 실험입니다.
 
-HF dataset viewer 기준 기본 split은 `train`, row 수는 20,120개이고 컬럼은 `imageA`, `imageB`입니다.
+`--split auto`는 dataset에 `test` split이 있으면 test를 쓰고, 없으면 `validation`, `train` 순서로 선택합니다. `--num-samples 0`은 선택된 split 전체를 평가합니다.
 
 ## Setup
 
 ```bash
-cd experiments/dino_night2day_pair_probe
-python -m venv .venv
+cd /Users/xwsa568/Projects/dino_exp
+python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
@@ -16,18 +16,22 @@ pip install -r requirements.txt
 ## Run
 
 ```bash
-python run_dino_pair_probe.py \
-  --num-samples 128 \
+python3 run_dino_pair_probe.py \
+  --split auto \
+  --num-samples 0 \
   --batch-size 16 \
-  --num-overlay-samples 2 \
-  --output-dir outputs/night2day_128
+  --metric-token-grid 8 \
+  --output-dir outputs/night2day_full_retrieval
 ```
 
-기본값은 `facebookresearch/dinov2`의 `dinov2_vitb14`를 `torch.hub`로 로드합니다. GPU가 있으면 `cuda`, Apple Silicon이면 `mps`, 아니면 `cpu`를 자동 선택합니다.
+기본값은 `facebookresearch/dinov2`의 `dinov2_vitb14`를 `torch.hub`로 로드합니다. GPU가 있으면 `cuda`, Apple Silicon이면 `mps`, 아니면 `cpu`를 자동 선택합니다. 전체 split retrieval은 모든 A에 대해 모든 B를 후보로 비교하므로 오래 걸릴 수 있습니다. 기본 `--metric-token-grid 8`은 16x16 DINO patch token을 8x8로 줄여 relation metric 비용을 낮춥니다. 전체 patch token을 쓰려면 `--metric-token-grid 0`을 지정합니다.
 
 ## Outputs
 
-- `summary.json`: paired vs shuffled metric summary.
+- `summary.json`: paired-vs-shuffled summary와 full retrieval summary.
+- `retrieval_summary.json`: metric별 true pair rank 요약.
+- `retrieval_summary.csv`: `retrieval_summary.json`의 table 형태.
+- `retrieval_ranks.csv`: sample별 true `imageB`의 rank와 true-pair score.
 - `scores.csv`: sample별 paired/shuffled 점수.
 - `score_distributions.png`: paired/shuffled 점수 분포.
 - `pair_grid.png`: `imageA`, true `imageB`, shuffled `imageB` 비교 grid.
@@ -37,12 +41,13 @@ python run_dino_pair_probe.py \
 
 ## Metrics
 
-- `dino_rel_cos`: DINO patch-token self-similarity matrix 간 cosine similarity. 높을수록 비슷합니다.
-- `dino_rel_mse`: self-similarity matrix MSE. 낮을수록 비슷합니다.
-- `dino_rel_2gram_skl`: repo의 DINO relation loss와 같은 계열의 second-order relation KL을 symmetric하게 계산한 값. 낮을수록 비슷합니다.
-- `token_cos`: 같은 spatial token 위치끼리의 평균 DINO cosine similarity. relation 전의 참고값입니다.
+- `pixel_l1`, `pixel_l2`: resized RGB pixel vector 차이. 낮을수록 비슷합니다.
+- `dino_token_cos`, `dino_token_l1`, `dino_token_l2`: 같은 spatial DINO patch feature끼리 직접 비교한 metric입니다.
+- `dino_rel1_cos`, `dino_rel1_l1`, `dino_rel1_l2`, `dino_rel1_skl`: DINO patch-token self-similarity matrix, 즉 1차 relation matrix 비교입니다.
+- `dino_rel2_cos`, `dino_rel2_l1`, `dino_rel2_l2`, `dino_rel2_skl`: 1차 relation row들 사이의 relation, 즉 2차 relation matrix 비교입니다.
+- `*_skl`: row-wise softmax 후 symmetric KL을 평균낸 값입니다. 낮을수록 비슷합니다.
 
-요약의 `improvement_mean`은 paired가 shuffled보다 좋은 방향을 양수로 정규화한 값입니다.
+Paired-vs-shuffled 요약의 `improvement_mean`은 paired가 shuffled보다 좋은 방향을 양수로 정규화한 값입니다. Retrieval 요약에서는 `mean_rank`, `median_rank`, `mrr`, `top1_rate`, `top5_rate`, `top10_rate`, `top1pct_rate`, `mean_pair_percentile`로 어떤 metric이 true pair를 가장 잘 찾는지 비교합니다.
 
 ## Patch Relation Overlays
 
