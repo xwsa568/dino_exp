@@ -4,6 +4,8 @@ import csv
 import json
 import os
 import random
+import re
+import shutil
 import tarfile
 import urllib.request
 from dataclasses import dataclass
@@ -69,6 +71,49 @@ def parse_args() -> argparse.Namespace:
         help="How to split each side-by-side pix2pix image into A/B. Auto treats the darker half as night/A.",
     )
     parser.add_argument("--num-samples", type=int, default=0, help="Number of pairs to sample. 0 uses the full split.")
+    parser.add_argument(
+        "--one-per-prefix",
+        dest="one_per_prefix",
+        action="store_true",
+        default=True,
+        help="Keep only the first sorted file for each filename prefix before '_' in any split.",
+    )
+    parser.add_argument(
+        "--no-one-per-prefix",
+        dest="one_per_prefix",
+        action="store_false",
+        help="Use every file in the selected split instead of one file per filename prefix.",
+    )
+    parser.add_argument(
+        "--test-one-per-prefix",
+        dest="one_per_prefix",
+        action="store_true",
+        help="Deprecated alias for --one-per-prefix.",
+    )
+    parser.add_argument(
+        "--no-test-one-per-prefix",
+        dest="one_per_prefix",
+        action="store_false",
+        help="Deprecated alias for --no-one-per-prefix.",
+    )
+    parser.add_argument(
+        "--selected-set-dir",
+        default="selected_set",
+        help="Subdirectory under --output-dir where selected files and A/B crops are saved.",
+    )
+    parser.add_argument(
+        "--save-selected-set",
+        dest="save_selected_set",
+        action="store_true",
+        default=True,
+        help="Save a manifest and image copies for the selected split.",
+    )
+    parser.add_argument(
+        "--no-save-selected-set",
+        dest="save_selected_set",
+        action="store_false",
+        help="Do not save the selected split manifest/images.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--model-repo", default="facebookresearch/dinov2")
     parser.add_argument("--model-name", default="dinov2_vitb14")
@@ -163,14 +208,21 @@ def configure_cache(args: argparse.Namespace) -> Path:
     return cache_dir
 
 
+def natural_path_key(path: Path) -> List[object]:
+    return [int(part) if part.isdigit() else part for part in re.split(r"(\d+)", path.name)]
+
+
 def image_paths_for_split(dataset_root: Path, split: str) -> List[Path]:
     split_dir = dataset_root / split
     if not split_dir.is_dir():
         return []
     return sorted(
-        path
-        for path in split_dir.iterdir()
-        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+        [
+            path
+            for path in split_dir.iterdir()
+            if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+        ],
+        key=natural_path_key,
     )
 
 
@@ -331,13 +383,40 @@ def resolve_pair_order(pair_order: str, paths: Sequence[Path]) -> str:
     return "left-right" if float(np.mean(left_means)) <= float(np.mean(right_means)) else "right-left"
 
 
-def load_samples(args: argparse.Namespace, dataset_root: Path) -> Tuple[List[Image.Image], List[Image.Image], List[Path], str]:
+def filename_prefix(path: Path) -> str:
+    return path.stem.split("_", 1)[0]
+
+
+def first_path_per_prefix(paths: Sequence[Path]) -> Tuple[List[Path], Dict[str, int]]:
+    selected = []
+    group_counts: Dict[str, int] = {}
+    seen = set()
+    for path in paths:
+        prefix = filename_prefix(path)
+        group_counts[prefix] = group_counts.get(prefix, 0) + 1
+        if prefix not in seen:
+            selected.append(path)
+            seen.add(prefix)
+    return selected, group_counts
+
+
+def load_samples(
+    args: argparse.Namespace,
+    dataset_root: Path,
+) -> Tuple[List[Image.Image], List[Image.Image], List[Path], str, Dict[str, object]]:
     if args.num_samples < 0:
         raise ValueError("--num-samples must be >= 0. Use 0 for the full split.")
 
     paths = image_paths_for_split(dataset_root, args.split)
     if not paths:
         raise ValueError(f"No paired images found in split '{args.split}' under {dataset_root}.")
+
+    original_count = len(paths)
+    group_counts: Dict[str, int] = {}
+    selection_rule = "full_split"
+    if args.one_per_prefix:
+        paths, group_counts = first_path_per_prefix(paths)
+        selection_rule = "first_sorted_file_per_filename_prefix"
 
     rng = random.Random(args.seed)
     if args.num_samples == 0:
@@ -359,7 +438,72 @@ def load_samples(args: argparse.Namespace, dataset_root: Path) -> Tuple[List[Ima
         else:
             images_a.append(right)
             images_b.append(left)
-    return images_a, images_b, selected_paths, resolved_pair_order
+    selection_info = {
+        "selection_rule": selection_rule,
+        "original_split_count": original_count,
+        "post_filter_count": len(paths),
+        "selected_count": len(selected_paths),
+        "prefix_group_counts": group_counts,
+        "prefixes": [filename_prefix(path) for path in selected_paths],
+    }
+    return images_a, images_b, selected_paths, resolved_pair_order, selection_info
+
+
+def save_selected_set(
+    output_dir: Path,
+    selected_set_dir: str,
+    sample_paths: Sequence[Path],
+    images_a: Sequence[Image.Image],
+    images_b: Sequence[Image.Image],
+    pair_order: str,
+    selection_info: Dict[str, object],
+) -> Path:
+    selected_dir = output_dir / selected_set_dir
+    originals_dir = selected_dir / "original_pairs"
+    image_a_dir = selected_dir / "imageA"
+    image_b_dir = selected_dir / "imageB"
+    originals_dir.mkdir(parents=True, exist_ok=True)
+    image_a_dir.mkdir(parents=True, exist_ok=True)
+    image_b_dir.mkdir(parents=True, exist_ok=True)
+
+    manifest_path = selected_dir / "manifest.csv"
+    with manifest_path.open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            [
+                "idx",
+                "prefix",
+                "filename",
+                "source_path",
+                "copied_pair_path",
+                "image_a_path",
+                "image_b_path",
+                "pair_order",
+                "selection_rule",
+            ]
+        )
+        for idx, path in enumerate(sample_paths):
+            safe_name = f"{idx:04d}_{path.name}"
+            pair_copy = originals_dir / safe_name
+            image_a_path = image_a_dir / f"{idx:04d}_{path.stem}_A.jpg"
+            image_b_path = image_b_dir / f"{idx:04d}_{path.stem}_B.jpg"
+            shutil.copy2(path, pair_copy)
+            images_a[idx].save(image_a_path, quality=95)
+            images_b[idx].save(image_b_path, quality=95)
+            writer.writerow(
+                [
+                    idx,
+                    filename_prefix(path),
+                    path.name,
+                    str(path),
+                    str(pair_copy),
+                    str(image_a_path),
+                    str(image_b_path),
+                    pair_order,
+                    selection_info["selection_rule"],
+                ]
+            )
+    return selected_dir
 
 
 def pil_to_dino_tensor(image: Image.Image, image_size: int) -> torch.Tensor:
@@ -1362,11 +1506,24 @@ def main() -> None:
     print(f"torch_hub_dir={Path(args.torch_hub_dir).resolve()}")
     print(f"requested_split={requested_split} resolved_split={args.split}")
 
-    images_a, images_b, sample_paths, pair_order = load_samples(args, dataset_root)
+    images_a, images_b, sample_paths, pair_order, selection_info = load_samples(args, dataset_root)
     print(
         f"dataset_root={dataset_root} resolved_dataset_root={dataset_root.resolve()} "
-        f"split={args.split} pair_order={pair_order} num_pairs={len(images_a)}"
+        f"split={args.split} pair_order={pair_order} "
+        f"selection_rule={selection_info['selection_rule']} num_pairs={len(images_a)}"
     )
+    selected_set_path = None
+    if args.save_selected_set:
+        selected_set_path = save_selected_set(
+            output_dir,
+            args.selected_set_dir,
+            sample_paths,
+            images_a,
+            images_b,
+            pair_order,
+            selection_info,
+        )
+        print(f"saved selected set to {selected_set_path.resolve()}")
     shuffled_indices = derangement_indices(len(images_a), args.seed + 17)
 
     extractor = DinoExtractor(args, device)
@@ -1388,6 +1545,8 @@ def main() -> None:
         "num_samples": len(images_a),
         "sample_path_count": len(sample_paths),
         "first_sample_paths": [str(path) for path in sample_paths[:20]],
+        "selection": selection_info,
+        "selected_set_dir": str(selected_set_path.resolve()) if selected_set_path else None,
         "cache_dir": str(cache_dir.resolve()),
         "torch_hub_dir": str(Path(args.torch_hub_dir).resolve()),
         "model_repo": args.model_repo,
