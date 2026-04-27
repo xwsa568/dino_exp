@@ -1,8 +1,8 @@
 # DINO Night2Day Pair Probe
 
-Hugging Face `huggan/night2day`의 `imageA` / `imageB`가 실제 night/day 대응쌍이면, 같은 row의 DINO feature/relation이 전체 `imageB` 후보 중에서도 높은 순위로 매칭되어야 한다는 가정을 테스트하는 standalone 실험입니다.
+pix2pix 논문에서 사용한 `night2day` paired image가 실제 night/day 대응쌍이면, 같은 파일의 좌/우 절반에서 나온 DINO feature/relation이 전체 day 후보 중에서도 높은 순위로 매칭되어야 한다는 가정을 테스트하는 standalone 실험입니다.
 
-`--split auto`는 dataset에 `test` split이 있으면 test를 쓰고, 없으면 `validation`, `train` 순서로 선택합니다. `--num-samples 0`은 선택된 split 전체를 평가합니다.
+`--split auto`는 dataset에 `test` split이 있으면 test를 쓰고, 없으면 `validation`, `val`, `train` 순서로 선택합니다. pix2pix `night2day.tar.gz` 기준으로는 `train`, `test`, `val`이 있으므로 기본값은 `test`입니다. `--num-samples 0`은 선택된 split 전체를 평가합니다.
 
 ## Setup
 
@@ -24,7 +24,13 @@ python3 run_dino_pair_probe.py \
   --output-dir outputs/night2day_full_retrieval
 ```
 
-기본값은 `facebookresearch/dinov2`의 `dinov2_vitb14`를 `torch.hub`로 로드합니다. GPU가 있으면 `cuda`, Apple Silicon이면 `mps`, 아니면 `cpu`를 자동 선택합니다. 전체 split retrieval은 모든 A에 대해 모든 B를 후보로 비교하므로 오래 걸릴 수 있습니다. 기본 `--metric-token-grid 8`은 16x16 DINO patch token을 8x8로 줄여 relation metric 비용을 낮춥니다. 전체 patch token을 쓰려면 `--metric-token-grid 0`을 지정합니다.
+기본값은 `cache/datasets/night2day`가 있으면 그걸 씁니다. 없지만 현재 디렉토리에 `night2day`가 있으면 `cache/datasets/night2day` symlink를 만들어 그 경로로 읽고, 둘 다 없으면 pix2pix 원본 URL에서 `cache/datasets/night2day.tar.gz`로 다운로드하고 `cache/datasets/night2day`에 압축을 풉니다. DINOv2는 `facebookresearch/dinov2`의 `dinov2_vitb14`를 `torch.hub`로 로드하며, torch hub/model 다운로드는 기본적으로 `cache/torch_hub`와 `cache/torch` 아래에 저장됩니다.
+
+pix2pix 파일은 `(512, 256)` 좌우 결합 이미지입니다. `--pair-order auto`는 더 어두운 절반을 night/source A로, 다른 절반을 day/target B로 사용합니다. 현재 `night2day` 원본에서는 보통 왼쪽이 night, 오른쪽이 day라서 `left-right`로 해석됩니다.
+
+GPU가 있으면 `cuda`, Apple Silicon이면 `mps`, 아니면 `cpu`를 자동 선택합니다. 전체 split retrieval은 모든 A에 대해 모든 B를 후보로 비교하므로 오래 걸릴 수 있습니다. 기본 `--metric-token-grid 8`은 16x16 DINO patch token을 8x8로 줄여 relation metric 비용을 낮춥니다. 전체 patch token을 쓰려면 `--metric-token-grid 0`을 지정합니다.
+
+GPU 번호를 직접 고르려면 torch device 문자열을 그대로 넘기면 됩니다. 예: `--device cuda:1`. Retrieval ranking만 다른 장치에서 돌리고 싶으면 `--ranking-device cuda:0`처럼 따로 지정할 수 있고, 기본값 `auto`는 extraction device를 그대로 씁니다.
 
 ## Outputs
 

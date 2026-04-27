@@ -1,5 +1,4 @@
 torch
-datasets
 Pillow
 matplotlib
 numpy

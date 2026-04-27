@@ -2,7 +2,10 @@
 import argparse
 import csv
 import json
+import os
 import random
+import tarfile
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -14,32 +17,59 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
-from datasets import get_dataset_split_names, load_dataset
 from PIL import Image, ImageDraw, ImageFont
 from tqdm.auto import tqdm
 
 
+DEFAULT_DATASET_URL = "http://efrosgans.eecs.berkeley.edu/pix2pix/datasets/night2day.tar.gz"
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+SPLIT_PRIORITY = ("test", "validation", "val", "train")
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Probe whether huggan/night2day imageA/imageB pairs preserve DINO relation structure."
+        description="Probe whether pix2pix night2day paired images preserve DINO relation structure."
     )
-    parser.add_argument("--dataset", default="huggan/night2day", help="HF dataset name.")
+    parser.add_argument(
+        "--cache-dir",
+        default="cache",
+        help="Directory for dataset/model downloads. Defaults to ./cache.",
+    )
+    parser.add_argument(
+        "--dataset-root",
+        default=None,
+        help="Extracted pix2pix night2day directory. Defaults to cache/datasets/night2day if present, then ./night2day.",
+    )
+    parser.add_argument(
+        "--dataset-url",
+        default=DEFAULT_DATASET_URL,
+        help="pix2pix night2day tarball URL used when no local dataset root is found.",
+    )
+    parser.add_argument(
+        "--dataset-archive",
+        default=None,
+        help="Optional existing night2day.tar.gz. Defaults to cache/datasets/night2day.tar.gz; ./night2day.tar.gz is reused if present.",
+    )
+    parser.add_argument(
+        "--no-download-dataset",
+        action="store_true",
+        help="Fail if the pix2pix dataset is not already available locally.",
+    )
     parser.add_argument(
         "--split",
         default="auto",
-        help="HF dataset split. 'auto' uses test if present, then validation, then train.",
+        help="pix2pix dataset split. 'auto' uses test if present, then validation, val, then train.",
     )
-    parser.add_argument("--column-a", default="imageA", help="Source/night image column.")
-    parser.add_argument("--column-b", default="imageB", help="Target/day image column.")
-    parser.add_argument("--num-samples", type=int, default=0, help="Number of rows to sample. 0 uses the full split.")
+    parser.add_argument(
+        "--pair-order",
+        default="auto",
+        choices=["auto", "left-right", "right-left"],
+        help="How to split each side-by-side pix2pix image into A/B. Auto treats the darker half as night/A.",
+    )
+    parser.add_argument("--num-samples", type=int, default=0, help="Number of pairs to sample. 0 uses the full split.")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--streaming", dest="streaming", action="store_true", default=False)
-    parser.add_argument("--no-streaming", dest="streaming", action="store_false")
-    parser.add_argument("--shuffle-buffer", type=int, default=1024)
     parser.add_argument("--model-repo", default="facebookresearch/dinov2")
     parser.add_argument("--model-name", default="dinov2_vitb14")
     parser.add_argument("--image-size", type=int, default=224, help="Square resize before DINO.")
@@ -53,12 +83,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--tau", type=float, default=0.1, help="Temperature for second-order relation KL.")
     parser.add_argument("--remove-diag", action="store_true", help="Ignore self-similarity diagonal.")
-    parser.add_argument("--device", default="auto", choices=["auto", "cuda", "mps", "cpu"])
+    parser.add_argument(
+        "--device",
+        default="auto",
+        help="Extraction device: auto, cpu, mps, cuda, or an explicit torch device like cuda:1.",
+    )
     parser.add_argument(
         "--ranking-device",
         default="auto",
-        choices=["auto", "cuda", "mps", "cpu"],
-        help="Device for all-B retrieval scoring. Defaults to the extraction device.",
+        help="Device for all-B retrieval scoring. Use auto to match --device, or pass e.g. cpu/cuda:1.",
     )
     parser.add_argument("--ranking-query-batch-size", type=int, default=8)
     parser.add_argument("--ranking-candidate-batch-size", type=int, default=128)
@@ -71,7 +104,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--skip-retrieval", action="store_true", help="Only run paired-vs-shuffled summaries and plots.")
     parser.add_argument("--skip-paired-shuffled", action="store_true", help="Only run full all-B retrieval ranking.")
-    parser.add_argument("--torch-hub-dir", default=None, help="Optional torch.hub cache dir.")
+    parser.add_argument("--torch-hub-dir", default=None, help="Optional torch.hub cache dir. Defaults to <cache-dir>/torch_hub.")
     parser.add_argument("--output-dir", default="outputs/night2day_dino_probe")
     parser.add_argument("--num-grid", type=int, default=12, help="How many samples to show in pair_grid.png.")
     parser.add_argument("--num-heatmaps", type=int, default=4, help="How many samples to show in relation_heatmaps.png.")
@@ -87,12 +120,28 @@ def parse_args() -> argparse.Namespace:
 
 
 def choose_device(name: str) -> torch.device:
-    if name == "cuda":
-        return torch.device("cuda")
-    if name == "mps":
-        return torch.device("mps")
-    if name == "cpu":
-        return torch.device("cpu")
+    if name == "auto":
+        return choose_auto_device()
+
+    try:
+        device = torch.device(name)
+    except RuntimeError as exc:
+        raise ValueError(f"Invalid device '{name}'. Use auto, cpu, mps, cuda, or cuda:N.") from exc
+
+    if device.type == "cuda":
+        if not torch.cuda.is_available():
+            raise ValueError(f"CUDA device '{name}' was requested, but CUDA is not available.")
+        if device.index is not None and device.index >= torch.cuda.device_count():
+            raise ValueError(
+                f"CUDA device index {device.index} was requested, but only "
+                f"{torch.cuda.device_count()} CUDA device(s) are available."
+            )
+    if device.type == "mps" and not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
+        raise ValueError("MPS device was requested, but MPS is not available.")
+    return device
+
+
+def choose_auto_device() -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda")
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
@@ -100,16 +149,146 @@ def choose_device(name: str) -> torch.device:
     return torch.device("cpu")
 
 
-def resolve_split(dataset: str, split: str) -> str:
+def configure_cache(args: argparse.Namespace) -> Path:
+    cache_dir = Path(args.cache_dir).expanduser().resolve()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    torch_home = cache_dir / "torch"
+    torch_home.mkdir(parents=True, exist_ok=True)
+    os.environ["TORCH_HOME"] = str(torch_home)
+
+    torch_hub_dir = Path(args.torch_hub_dir).expanduser().resolve() if args.torch_hub_dir else cache_dir / "torch_hub"
+    torch_hub_dir.mkdir(parents=True, exist_ok=True)
+    args.torch_hub_dir = str(torch_hub_dir)
+    return cache_dir
+
+
+def image_paths_for_split(dataset_root: Path, split: str) -> List[Path]:
+    split_dir = dataset_root / split
+    if not split_dir.is_dir():
+        return []
+    return sorted(
+        path
+        for path in split_dir.iterdir()
+        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+    )
+
+
+def available_splits(dataset_root: Path) -> List[str]:
+    if not dataset_root.is_dir():
+        return []
+    return sorted(
+        path.name
+        for path in dataset_root.iterdir()
+        if path.is_dir() and image_paths_for_split(dataset_root, path.name)
+    )
+
+
+def is_dataset_root(dataset_root: Path) -> bool:
+    return bool(available_splits(dataset_root))
+
+
+def resolve_split(dataset_root: Path, split: str) -> str:
+    split_names = available_splits(dataset_root)
     if split != "auto":
-        return split
-    split_names = get_dataset_split_names(dataset)
-    for preferred in ("test", "validation", "val", "train"):
+        aliases = [split]
+        if split == "validation":
+            aliases.append("val")
+        elif split == "val":
+            aliases.append("validation")
+        for name in aliases:
+            if name in split_names:
+                return name
+        raise ValueError(
+            f"Split '{split}' was not found under {dataset_root}. Available splits: {split_names}"
+        )
+
+    for preferred in SPLIT_PRIORITY:
         if preferred in split_names:
             return preferred
     if not split_names:
-        raise ValueError(f"No splits found for dataset '{dataset}'.")
+        raise ValueError(f"No image splits found under {dataset_root}.")
     return split_names[0]
+
+
+def download_file(url: str, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with urllib.request.urlopen(url) as response:
+        total = int(response.headers.get("Content-Length") or 0)
+        with path.open("wb") as handle, tqdm(
+            total=total,
+            unit="B",
+            unit_scale=True,
+            desc=f"Downloading {path.name}",
+        ) as progress:
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                handle.write(chunk)
+                progress.update(len(chunk))
+
+
+def safe_extract_tar(archive_path: Path, extract_dir: Path) -> None:
+    extract_dir.mkdir(parents=True, exist_ok=True)
+    root = extract_dir.resolve()
+    with tarfile.open(archive_path, "r:gz") as tar:
+        for member in tar.getmembers():
+            target = (extract_dir / member.name).resolve()
+            if target != root and root not in target.parents:
+                raise RuntimeError(f"Refusing to extract unsafe tar member: {member.name}")
+        tar.extractall(extract_dir)
+
+
+def prepare_dataset_root(args: argparse.Namespace, cache_dir: Path) -> Path:
+    dataset_cache_dir = cache_dir / "datasets"
+    dataset_cache_dir.mkdir(parents=True, exist_ok=True)
+    cached_root = dataset_cache_dir / "night2day"
+
+    explicit_root = Path(args.dataset_root).expanduser() if args.dataset_root else None
+    if explicit_root:
+        if is_dataset_root(explicit_root):
+            return explicit_root
+    elif is_dataset_root(cached_root):
+        return cached_root
+    else:
+        local_root = Path("night2day")
+        if is_dataset_root(local_root):
+            if not cached_root.exists():
+                try:
+                    cached_root.symlink_to(local_root.resolve(), target_is_directory=True)
+                except OSError:
+                    return local_root
+            if is_dataset_root(cached_root):
+                return cached_root
+            return local_root
+
+    if explicit_root:
+        raise FileNotFoundError(
+            f"--dataset-root does not look like an extracted pix2pix night2day directory: {explicit_root}"
+        )
+    if args.no_download_dataset:
+        raise FileNotFoundError(
+            f"Could not find pix2pix night2day under {cached_root} or ./night2day, and --no-download-dataset was set."
+        )
+
+    archive_path = (
+        Path(args.dataset_archive).expanduser()
+        if args.dataset_archive
+        else dataset_cache_dir / "night2day.tar.gz"
+    )
+    if not archive_path.exists():
+        local_archive = Path("night2day.tar.gz")
+        if args.dataset_archive is None and local_archive.exists():
+            archive_path = local_archive
+        else:
+            download_file(args.dataset_url, archive_path)
+
+    print(f"extracting dataset archive {archive_path} to {dataset_cache_dir}")
+    safe_extract_tar(archive_path, dataset_cache_dir)
+    if not is_dataset_root(cached_root):
+        raise RuntimeError(f"Archive extraction did not create a valid dataset root at {cached_root}")
+    return cached_root
 
 
 def storage_dtype(name: str) -> torch.dtype:
@@ -120,48 +299,67 @@ def storage_dtype(name: str) -> torch.dtype:
     raise ValueError(f"Unsupported storage dtype: {name}")
 
 
-def to_rgb_pil(value) -> Image.Image:
-    if isinstance(value, Image.Image):
-        return value.convert("RGB")
-    if isinstance(value, dict) and "bytes" in value:
-        import io
+def split_pix2pix_pair(path: Path) -> Tuple[Image.Image, Image.Image]:
+    with Image.open(path) as image:
+        image = image.convert("RGB")
+        width, height = image.size
+        if width % 2 != 0:
+            raise ValueError(f"Expected an even-width side-by-side pair image, got {image.size}: {path}")
+        half_width = width // 2
+        left = image.crop((0, 0, half_width, height)).copy()
+        right = image.crop((half_width, 0, width, height)).copy()
+    return left, right
 
-        return Image.open(io.BytesIO(value["bytes"])).convert("RGB")
-    if isinstance(value, (str, Path)):
-        return Image.open(value).convert("RGB")
-    raise TypeError(f"Unsupported image value type: {type(value)}")
+
+def resolve_pair_order(pair_order: str, paths: Sequence[Path]) -> str:
+    if pair_order != "auto":
+        return pair_order
+    left_means = []
+    right_means = []
+    for path in paths[: min(32, len(paths))]:
+        with Image.open(path) as image:
+            image = image.convert("RGB")
+            width, _ = image.size
+            if width % 2 != 0:
+                raise ValueError(f"Expected an even-width side-by-side pair image, got {image.size}: {path}")
+            arr = np.asarray(image, dtype=np.float32) / 255.0
+            half_width = width // 2
+            left_means.append(float(arr[:, :half_width].mean()))
+            right_means.append(float(arr[:, half_width:].mean()))
+    if not left_means:
+        raise ValueError("Cannot infer pair order from an empty split.")
+    return "left-right" if float(np.mean(left_means)) <= float(np.mean(right_means)) else "right-left"
 
 
-def load_samples(args: argparse.Namespace) -> Tuple[List[Image.Image], List[Image.Image]]:
+def load_samples(args: argparse.Namespace, dataset_root: Path) -> Tuple[List[Image.Image], List[Image.Image], List[Path], str]:
     if args.num_samples < 0:
         raise ValueError("--num-samples must be >= 0. Use 0 for the full split.")
 
-    if args.streaming:
-        ds = load_dataset(args.dataset, split=args.split, streaming=True)
-        ds = ds.shuffle(seed=args.seed, buffer_size=args.shuffle_buffer)
-        rows = []
-        iterator = iter(ds)
-        if args.num_samples == 0:
-            for row in tqdm(iterator, desc="Loading HF rows"):
-                rows.append(row)
-        else:
-            for _ in tqdm(range(args.num_samples), desc="Loading HF rows"):
-                rows.append(next(iterator))
+    paths = image_paths_for_split(dataset_root, args.split)
+    if not paths:
+        raise ValueError(f"No paired images found in split '{args.split}' under {dataset_root}.")
+
+    rng = random.Random(args.seed)
+    if args.num_samples == 0:
+        selected_paths = paths
     else:
-        ds = load_dataset(args.dataset, split=args.split)
-        rng = random.Random(args.seed)
-        if args.num_samples == 0:
-            indices = list(range(len(ds)))
+        selected_paths = rng.sample(paths, k=min(args.num_samples, len(paths)))
+
+    if len(selected_paths) < 2:
+        raise ValueError("Need at least two pairs because shuffled negatives and retrieval ranks need candidates.")
+
+    resolved_pair_order = resolve_pair_order(args.pair_order, paths)
+    images_a = []
+    images_b = []
+    for path in tqdm(selected_paths, desc=f"Loading pix2pix {args.split} pairs"):
+        left, right = split_pix2pix_pair(path)
+        if resolved_pair_order == "left-right":
+            images_a.append(left)
+            images_b.append(right)
         else:
-            indices = rng.sample(range(len(ds)), k=min(args.num_samples, len(ds)))
-        rows = [ds[i] for i in tqdm(indices, desc="Loading HF rows")]
-
-    if len(rows) < 2:
-        raise ValueError("Need at least two rows because shuffled negatives and retrieval ranks need candidates.")
-
-    images_a = [to_rgb_pil(row[args.column_a]) for row in rows]
-    images_b = [to_rgb_pil(row[args.column_b]) for row in rows]
-    return images_a, images_b
+            images_a.append(right)
+            images_b.append(left)
+    return images_a, images_b, selected_paths, resolved_pair_order
 
 
 def pil_to_dino_tensor(image: Image.Image, image_size: int) -> torch.Tensor:
@@ -1142,7 +1340,9 @@ def run_full_retrieval(
 def main() -> None:
     args = parse_args()
     requested_split = args.split
-    args.split = resolve_split(args.dataset, args.split)
+    cache_dir = configure_cache(args)
+    dataset_root = prepare_dataset_root(args, cache_dir)
+    args.split = resolve_split(dataset_root, args.split)
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -1155,10 +1355,15 @@ def main() -> None:
     dtype = storage_dtype(args.storage_dtype)
     print(f"device={device}")
     print(f"ranking_device={ranking_device}")
+    print(f"cache_dir={cache_dir.resolve()}")
+    print(f"torch_hub_dir={Path(args.torch_hub_dir).resolve()}")
     print(f"requested_split={requested_split} resolved_split={args.split}")
-    print(f"dataset={args.dataset} split={args.split} columns=({args.column_a}, {args.column_b})")
 
-    images_a, images_b = load_samples(args)
+    images_a, images_b, sample_paths, pair_order = load_samples(args, dataset_root)
+    print(
+        f"dataset_root={dataset_root} resolved_dataset_root={dataset_root.resolve()} "
+        f"split={args.split} pair_order={pair_order} num_pairs={len(images_a)}"
+    )
     shuffled_indices = derangement_indices(len(images_a), args.seed + 17)
 
     extractor = DinoExtractor(args, device)
@@ -1168,12 +1373,20 @@ def main() -> None:
         raise RuntimeError(f"A/B DINO token grids differ: {token_grid_a} vs {token_grid_b}")
 
     summary = {
-        "dataset": args.dataset,
+        "dataset": "pix2pix/night2day",
+        "dataset_root": str(dataset_root),
+        "dataset_root_resolved": str(dataset_root.resolve()),
         "requested_split": requested_split,
         "split": args.split,
-        "column_a": args.column_a,
-        "column_b": args.column_b,
+        "pair_order_requested": args.pair_order,
+        "pair_order": pair_order,
+        "image_a": "night/source image used for DINO A",
+        "image_b": "day/target image used for DINO B",
         "num_samples": len(images_a),
+        "sample_path_count": len(sample_paths),
+        "first_sample_paths": [str(path) for path in sample_paths[:20]],
+        "cache_dir": str(cache_dir.resolve()),
+        "torch_hub_dir": str(Path(args.torch_hub_dir).resolve()),
         "model_repo": args.model_repo,
         "model_name": args.model_name,
         "image_size": args.image_size,
