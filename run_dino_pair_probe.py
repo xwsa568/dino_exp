@@ -129,6 +129,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tau", type=float, default=0.1, help="Temperature for second-order relation KL.")
     parser.add_argument("--remove-diag", action="store_true", help="Ignore self-similarity diagonal.")
     parser.add_argument(
+        "--spatial-norm-gamma",
+        type=float,
+        default=0.7,
+        help="Gamma for DINO token spatial normalization metrics. Set 0 to only divide by spatial std.",
+    )
+    parser.add_argument(
         "--device",
         default="auto",
         help="Extraction device: auto, cpu, mps, cuda, or an explicit torch device like cuda:1.",
@@ -613,6 +619,13 @@ def kl_rows(ref_logits: torch.Tensor, pred_logits: torch.Tensor, tau: float) -> 
     return (p_ref * (log_ref - log_pred)).sum(dim=-1).mean(dim=-1)
 
 
+def spatial_normalize_tokens(tokens: torch.Tensor, gamma: float = 1.0, eps: float = 1e-6) -> torch.Tensor:
+    x = tokens.float()
+    mean = x.mean(dim=1, keepdim=True)
+    std = x.std(dim=1, keepdim=True, unbiased=False)
+    return (x - float(gamma) * mean) / (std + eps)
+
+
 def score_tokens(
     tokens_a: torch.Tensor,
     tokens_b: torch.Tensor,
@@ -620,6 +633,7 @@ def score_tokens(
     seed: int,
     tau: float,
     remove_diag: bool,
+    spatial_norm_gamma: float,
 ) -> Dict[str, np.ndarray]:
     tokens_a, tokens_b = maybe_subsample_tokens(tokens_a, tokens_b, token_subsample, seed)
 
@@ -628,6 +642,14 @@ def score_tokens(
     token_cos = (norm_a * norm_b).sum(dim=-1).mean(dim=-1)
     token_l1 = (tokens_a.float() - tokens_b.float()).abs().flatten(1).mean(dim=-1)
     token_l2 = F.mse_loss(tokens_a.float(), tokens_b.float(), reduction="none").flatten(1).mean(dim=-1)
+
+    spnorm_a = spatial_normalize_tokens(tokens_a, gamma=spatial_norm_gamma)
+    spnorm_b = spatial_normalize_tokens(tokens_b, gamma=spatial_norm_gamma)
+    spnorm_norm_a = F.normalize(spnorm_a, dim=-1, eps=1e-6)
+    spnorm_norm_b = F.normalize(spnorm_b, dim=-1, eps=1e-6)
+    spnorm_cos = (spnorm_norm_a * spnorm_norm_b).sum(dim=-1).mean(dim=-1)
+    spnorm_l1 = (spnorm_a - spnorm_b).abs().flatten(1).mean(dim=-1)
+    spnorm_l2 = F.mse_loss(spnorm_a, spnorm_b, reduction="none").flatten(1).mean(dim=-1)
 
     gram_a = self_similarity(tokens_a, remove_diag=remove_diag)
     gram_b = self_similarity(tokens_b, remove_diag=remove_diag)
@@ -646,6 +668,9 @@ def score_tokens(
         "token_cos": token_cos.cpu().numpy(),
         "dino_token_l1": token_l1.cpu().numpy(),
         "dino_token_l2": token_l2.cpu().numpy(),
+        "dino_token_spnorm_cos": spnorm_cos.cpu().numpy(),
+        "dino_token_spnorm_l1": spnorm_l1.cpu().numpy(),
+        "dino_token_spnorm_l2": spnorm_l2.cpu().numpy(),
         "dino_rel1_cos": rel1_cos.cpu().numpy(),
         "dino_rel1_l1": rel1_l1.cpu().numpy(),
         "dino_rel1_l2": rel1_l2.cpu().numpy(),
@@ -752,6 +777,9 @@ ALL_RETRIEVAL_METRICS = [
     "dino_token_cos",
     "dino_token_l1",
     "dino_token_l2",
+    "dino_token_spnorm_cos",
+    "dino_token_spnorm_l1",
+    "dino_token_spnorm_l2",
     "dino_rel1_cos",
     "dino_rel1_l1",
     "dino_rel1_l2",
@@ -829,6 +857,23 @@ def normalized_token_flat_batches(x: torch.Tensor, dtype: torch.dtype, batch_siz
     for start in tqdm(range(0, x.shape[0], batch_size), desc=desc):
         tokens = x[start : start + batch_size].float()
         batches.append(F.normalize(tokens, dim=-1, eps=1e-6).flatten(1).cpu().to(dtype))
+    return torch.cat(batches, dim=0)
+
+
+def spatial_normalized_token_flat_batches(
+    x: torch.Tensor,
+    gamma: float,
+    dtype: torch.dtype,
+    batch_size: int,
+    desc: str,
+    channel_normalize: bool,
+) -> torch.Tensor:
+    batches = []
+    for start in tqdm(range(0, x.shape[0], batch_size), desc=desc):
+        tokens = spatial_normalize_tokens(x[start : start + batch_size], gamma=gamma)
+        if channel_normalize:
+            tokens = F.normalize(tokens, dim=-1, eps=1e-6)
+        batches.append(tokens.flatten(1).cpu().to(dtype))
     return torch.cat(batches, dim=0)
 
 
@@ -1090,6 +1135,9 @@ def save_distribution_plot(
         ("token_cos", "DINO token cosine (higher is better)"),
         ("dino_token_l1", "DINO token L1 (lower is better)"),
         ("dino_token_l2", "DINO token L2 (lower is better)"),
+        ("dino_token_spnorm_cos", "Spatial-norm token cosine (higher is better)"),
+        ("dino_token_spnorm_l1", "Spatial-norm token L1 (lower is better)"),
+        ("dino_token_spnorm_l2", "Spatial-norm token L2 (lower is better)"),
         ("dino_rel1_cos", "1st-order relation cosine (higher is better)"),
         ("dino_rel1_l1", "1st-order relation L1 (lower is better)"),
         ("dino_rel1_l2", "1st-order relation L2 (lower is better)"),
@@ -1411,6 +1459,61 @@ def run_full_retrieval(
                 scale=1.0 / float(tokens_a.shape[1]),
             )
             del token_cos_a, token_cos_b
+        if {"dino_token_spnorm_l1", "dino_token_spnorm_l2"} & token_metrics:
+            spnorm_a = spatial_normalized_token_flat_batches(
+                tokens_a,
+                args.spatial_norm_gamma,
+                dtype,
+                args.batch_size,
+                "Spatial-normalizing DINO tokens A",
+                channel_normalize=False,
+            )
+            spnorm_b = spatial_normalized_token_flat_batches(
+                tokens_b,
+                args.spatial_norm_gamma,
+                dtype,
+                args.batch_size,
+                "Spatial-normalizing DINO tokens B",
+                channel_normalize=False,
+            )
+            if "dino_token_spnorm_l1" in token_metrics:
+                results["dino_token_spnorm_l1"] = rank_vector_metric(
+                    "dino_token_spnorm_l1", spnorm_a, spnorm_b, "l1", False, ranking_device, qbs, cbs
+                )
+            if "dino_token_spnorm_l2" in token_metrics:
+                results["dino_token_spnorm_l2"] = rank_vector_metric(
+                    "dino_token_spnorm_l2", spnorm_a, spnorm_b, "l2", False, ranking_device, qbs, cbs
+                )
+            del spnorm_a, spnorm_b
+        if "dino_token_spnorm_cos" in token_metrics:
+            spnorm_cos_a = spatial_normalized_token_flat_batches(
+                tokens_a,
+                args.spatial_norm_gamma,
+                dtype,
+                args.batch_size,
+                "Spatial-normalizing DINO tokens A for cosine",
+                channel_normalize=True,
+            )
+            spnorm_cos_b = spatial_normalized_token_flat_batches(
+                tokens_b,
+                args.spatial_norm_gamma,
+                dtype,
+                args.batch_size,
+                "Spatial-normalizing DINO tokens B for cosine",
+                channel_normalize=True,
+            )
+            results["dino_token_spnorm_cos"] = rank_vector_metric(
+                "dino_token_spnorm_cos",
+                spnorm_cos_a,
+                spnorm_cos_b,
+                "cos",
+                True,
+                ranking_device,
+                qbs,
+                cbs,
+                scale=1.0 / float(tokens_a.shape[1]),
+            )
+            del spnorm_cos_a, spnorm_cos_b
 
     rel1_metrics = {m for m in selected_metrics if m.startswith("dino_rel1_")}
     rel2_metrics = {m for m in selected_metrics if m.startswith("dino_rel2_")}
@@ -1475,6 +1578,7 @@ def run_full_retrieval(
                 "ranking_candidate_batch_size": cbs,
                 "pixel_size": args.pixel_size,
                 "metric_token_grid": args.metric_token_grid,
+                "spatial_norm_gamma": args.spatial_norm_gamma,
                 "storage_dtype": args.storage_dtype,
                 "metrics": retrieval_summary,
             },
@@ -1555,6 +1659,7 @@ def main() -> None:
         "patch_grid": list(token_grid_a),
         "metric_token_grid": args.metric_token_grid,
         "token_subsample": args.token_subsample,
+        "spatial_norm_gamma": args.spatial_norm_gamma,
         "remove_diag": args.remove_diag,
         "overlay_anchors": args.overlay_anchors,
         "shuffled_indices_rule": "cyclic random shift derangement",
@@ -1570,6 +1675,7 @@ def main() -> None:
             seed=args.seed,
             tau=args.tau,
             remove_diag=args.remove_diag,
+            spatial_norm_gamma=args.spatial_norm_gamma,
         )
         shuffled_scores = score_tokens(
             tokens_a,
@@ -1578,6 +1684,7 @@ def main() -> None:
             seed=args.seed,
             tau=args.tau,
             remove_diag=args.remove_diag,
+            spatial_norm_gamma=args.spatial_norm_gamma,
         )
 
         higher_is_better = {
